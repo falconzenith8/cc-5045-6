@@ -58,7 +58,7 @@ npm run dev
 
 ## 调度与预热
 
-`src/temporal/scheduler.js` 产出执行计划：
+`src/temporal/frameGraph.js` 产出执行计划（经 `src/temporal/scheduler.js` 门面导出，旧入口不变）：
 
 - 每帧显式依赖：`historyColor@frame-1`、`historyDepth@frame-1`；本帧产出 `historyColor@frame`、`historyDepth@frame`。
 - 计划中的每个任务段声明其 `dependsOn`、`warmup`、`warmupStart/warmupEnd` 与产物。
@@ -67,6 +67,38 @@ npm run dev
 面板显示每段预热范围与依赖；重新计算计划时会跑 `validatePlan`，缺少预热会被标记为错误。
 
 未预热会把每段首帧当作无关静态图，历史权重从 0 重新爬升，接缝处出现数帧噪声回升（约 11 帧），随后回落——这正是周期性画质跳变。测试 `tests/e2e/temporal.spec.js` 用数值固定了这一点：无预热首帧采纳率 < 2%、权重 < 0.02；预热后首帧采纳率 > 90%、权重 > 0.7。
+
+## 历史所有权与取得/释放接口
+
+历史相关职责已从渲染器拆出，调度、历史存储与检查点各司其职，降噪算法与参数（`shaders.js` 与 `DEFAULT_SETTINGS`）保持不变：
+
+| 模块 | 职责 |
+| --- | --- |
+| `temporal/frameGraph.js` | 纯调度：执行计划、逐帧依赖、计划校验（无 GL、无状态） |
+| `temporal/historyStore.js` | GPU 历史产物（双缓冲颜色/权重 + 上一帧法线深度）的唯一所有者 |
+| `temporal/checkpointStore.js` | 检查点元数据：epoch/历史版本/帧身份，以及帧误差证据 |
+| `temporal/equivalence.js` | 帧 RMSE、亮度差与采纳率/权重差分，限定不同执行顺序的等价性 |
+| `temporal/scheduler.js` | 兼容门面，统一再导出上述符号，旧调用方无需改路径 |
+
+`HistoryStore` 的显式协议：
+
+- `acquire(frame)`：按**帧身份**借用历史。仅当 `frame === lastFrame + 1` 且链有效时才返回有效租约；链无效时返回 `valid:false` 的租约，渲染器走着色器原因码 1 的无历史回退（不用默认值遮错）。帧号不连续直接抛 `FrameIdentityError`。
+- `commit(lease)`：交还并交换双缓冲，写入帧身份、历史版本 `version` 单调递增。
+- `release(lease)`：中途取消只归还租约，**不销毁**共享历史；取消任务因此可以安全重跑。
+- `invalidate(reason)` / 渲染器 `clearHistory()` / `beginReplay(reason)`：失效并开启新的 `epoch`，存储本身保留。预热重放与取消后重跑通过 `beginReplay` 显式开重放窗口，再按对应帧身份重建。
+- `describe()`：返回 `{ valid, lastFrame, version, epoch, width, height }`，供检查点核对。
+
+`CheckpointStore.saveCheckpoint` 只接受有效链的 `{frame, epoch, version}`，不为缺失历史合成默认检查点；`verify(id, state)` 在 epoch/版本/帧身份漂移时返回明确问题。`JobRunner` 在每个段边界用真实历史版本建立检查点，并在取消时只 `releaseFrame` 不清历史。
+
+### 取消重排与历史缺失的等价性证据
+
+`npm run verify` 第 4 节固定了历史所有权重构的行为（本机实测）：
+
+- 取消后保留链末端（如帧 12、epoch 3、v13），重放开显式重放窗口（帧 9–19）；重跑交付帧与连续运行逐帧对比，最大像素 RMSE 约 0.0018（容差 0.02）、采纳率差 0.00pp、权重差 0.0000，在容差内等价。
+- 清除历史后 epoch 递增、链标记无效，下一帧采纳率 0%、原因码 1 像素数等于全帧像素，且 GPU 存储仍然保留（未被提前销毁）。
+- 重构前后同一 CLI 计划（moving-camera，84 帧、两段、预热 11）逐帧 `acceptedPct` 与 `meanHistoryWeight` 差分均为 0。
+
+对应回归在 `tests/e2e/historyOwnership.spec.js`（帧身份抛错、取消保留、历史缺失、检查点漂移）与 `tests/historyStore.test.js`、`tests/checkpointStore.test.js`。
 
 ## 三支测试短片
 
@@ -111,8 +143,8 @@ npm run cli -- export --scene background-reveal --out ./out
 ## 测试
 
 ```bash
-npm test          # 调度器、场景、相机/投影约定（14 项）
-npx playwright test  # 端到端：面板、预热接缝、导出、拖影与稳定性（6 项）
+npm test          # 调度、场景、相机/投影约定、历史存储与检查点（29 项）
+npx playwright test  # 端到端：面板、预热接缝、历史所有权、导出、拖影与稳定性（10 项）
 ```
 
 端到端测试在无头 Chromium（SwiftShader）下跑真实 WebGL2 管线，包含 WebM/复核包下载与解包校验。
@@ -121,16 +153,20 @@ npx playwright test  # 端到端：面板、预热接缝、导出、拖影与稳
 
 ```
 src/
-  math/mat4.js         矩阵与屏幕/NDC 约定
-  scene/scene.js       三支短片、运动解析式、相机、打包 uniform
-  render/shaders.js    GLSL：路径追踪、时序、空间、显示、采纳可视化
-  render/renderer.js   渲染器与历史状态、读回、呈现
-  render/jobRunner.js  按计划执行分段与预热、采集每帧结果
-  temporal/scheduler.js 依赖清单、分段、预热、校验
-  export/exporters.js  WebM 编码、复核包 ZIP、PNG
-  ui/App.jsx           任务面板
-cli/temporal-cli.mjs   辅助 CLI
-tests/                 单测、harness、Playwright 端到端
+  math/mat4.js            矩阵与屏幕/NDC 约定
+  scene/scene.js          三支短片、运动解析式、相机、打包 uniform
+  render/shaders.js       GLSL：路径追踪、时序、空间、显示、采纳可视化
+  render/renderer.js      渲染器与降噪 passes；经 HistoryStore 借用历史
+  render/jobRunner.js     按计划执行分段与预热、段边界检查点、采集每帧结果
+  temporal/frameGraph.js  帧依赖、分段、预热、校验（纯调度）
+  temporal/historyStore.js  GPU 历史所有权：acquire/commit/release、帧身份、epoch/版本
+  temporal/checkpointStore.js 检查点元数据与帧误差证据
+  temporal/equivalence.js 帧 RMSE/亮度/采纳差分与执行顺序等价判定
+  temporal/scheduler.js   兼容门面：再导出调度与历史接口
+  export/exporters.js     WebM 编码、复核包 ZIP、PNG
+  ui/App.jsx              任务面板（图形入口）
+cli/temporal-cli.mjs      辅助 CLI
+tests/                    单测、harness、Playwright 端到端
 ```
 
 ## 已知限制

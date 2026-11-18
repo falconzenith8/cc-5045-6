@@ -14,15 +14,20 @@ window.__harness = {
   renderFrames(start, end, opts = {}) {
     const out = [];
     for (let f = start; f <= end; f++) {
-      const m = renderer.renderFrame(f, opts);
+      // Legacy harness may replay arbitrary frame ranges; out-of-order frames
+      // explicitly restart the chain (allowRestart) and report an anomaly
+      // instead of silently attaching stale history.
+      const m = renderer.renderFrame(f, { ...opts, allowRestart: opts.allowRestart ?? true });
       out.push({ frame: f, ...m });
     }
     return out;
   },
   renderOne(frame, opts = {}) {
-    return renderer.renderFrame(frame, opts);
+    return renderer.renderFrame(frame, { ...opts, allowRestart: opts.allowRestart ?? true });
   },
   clearHistory() { renderer.clearHistory(); },
+  beginReplay(reason) { return renderer.beginReplay(reason); },
+  historyState() { return renderer.historyState(); },
   settings(patch) { renderer.setSettings(patch); },
   present(mode) { renderer.present({ mode }); },
   adoptionAt(x, y) { return renderer.sampleAdoption(x, y); },
@@ -234,6 +239,76 @@ window.__harness.temporalStability = function(frames, mode) {
   return acc / n;
 };
 window.__harness.resetForSeries = function(reset) { renderer.clearHistory(); };
+// Cancel/reorder probe for the history-ownership refactor.
+//
+// Renders the prefix [0..cancelAt], then simulates a cancel: the task stops
+// without invalidating history. The rerun opens an explicit replay window and
+// rebuilds the predecessor chain before delivering [resumeFrom..end]. Returns
+// per-frame RGBA8 captures plus the history version/epoch stamped on each
+// frame, so the host side can diff against a continuous run.
+window.__harness.cancelResumeRun = function(resumeFrom, end, cancelAt) {
+  renderer.clearHistory();
+  for (let f = 0; f <= cancelAt; f++) renderer.renderFrame(f);
+  const retained = renderer.historyState();
+  // Cancel must not destroy shared state; rerun rebuilds by frame identity.
+  renderer.beginReplay('cancel-resume-replay');
+  const replayStart = Math.max(0, resumeFrom - 11);
+  for (let f = replayStart; f < resumeFrom; f++) renderer.renderFrame(f);
+  const frames = [];
+  for (let f = resumeFrom; f <= end; f++) {
+    const metrics = renderer.renderFrame(f);
+    frames.push({
+      frame: f,
+      denoised: Array.from(renderer.captureRGBA8('denoised')),
+      metrics: {
+        acceptedPct: metrics.acceptedPct,
+        meanHistoryWeight: metrics.meanHistoryWeight,
+      },
+      historyVersion: metrics.historyVersion,
+      historyEpoch: metrics.historyEpoch,
+    });
+  }
+  return { retained, frames, replayRange: [replayStart, resumeFrom - 1] };
+};
+// Continuous reference for the same delivered range, with full history.
+window.__harness.continuousRun = function(start, end) {
+  renderer.clearHistory();
+  for (let f = 0; f < start; f++) renderer.renderFrame(f);
+  const frames = [];
+  for (let f = start; f <= end; f++) {
+    const metrics = renderer.renderFrame(f);
+    frames.push({
+      frame: f,
+      denoised: Array.from(renderer.captureRGBA8('denoised')),
+      metrics: {
+        acceptedPct: metrics.acceptedPct,
+        meanHistoryWeight: metrics.meanHistoryWeight,
+      },
+      historyVersion: metrics.historyVersion,
+      historyEpoch: metrics.historyEpoch,
+    });
+  }
+  return { frames };
+};
+// Missing-history probe: clear mid-chain, then the next frame must report the
+// reason-1 fallback (0% acceptance) and a new epoch while storage survives.
+window.__harness.missingHistoryProbe = function(framesBefore, nextFrame) {
+  renderer.clearHistory();
+  for (let f = 0; f < framesBefore; f++) renderer.renderFrame(f);
+  const before = renderer.historyState();
+  renderer.clearHistory();
+  const afterClear = renderer.historyState();
+  const metrics = renderer.renderFrame(nextFrame);
+  const after = renderer.historyState();
+  return {
+    before,
+    afterClear,
+    after,
+    nextAcceptedPct: metrics.acceptedPct,
+    nextReason1: metrics.reasons[1],
+    storageSurvived: renderer.rtHistory.length === 2 && !!renderer.rtPathPrevDepth,
+  };
+};
 window.__harness.staticRegionStability = function(frames, mode) {
   // Stability over pixels whose surface is static in the current run.
   const cap = [];
@@ -259,6 +334,13 @@ window.__harness.staticRegionStability = function(frames, mode) {
 window.__harness.renderRangeResetOnce = function(start, end, resetAtStart) {
   const out = [];
   if (resetAtStart) renderer.clearHistory();
+  // Legacy entry: a false resetAtStart still may replay an older range (warm-up
+  // after a prior run). Open an explicit replay window when the first frame is
+  // not the stored successor, so frame identity is named rather than violated.
+  const state = renderer.historyState();
+  if (!resetAtStart && state.valid && start !== state.lastFrame + 1) {
+    renderer.beginReplay(`legacy-renderRange@${start}`);
+  }
   for (let f = start; f <= end; f++) out.push({ frame: f, ...renderer.renderFrame(f) });
   return out;
 };

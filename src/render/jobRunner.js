@@ -7,12 +7,20 @@
 //   * noisy RGBA8 preview (raw path-traced frame, for review)
 //   * independent RGBA8 preview (per-frame denoise, for comparison)
 //   * adoption RGBA8 visualization (history acceptance)
-//   * per-frame metrics (history weight, reject reasons)
+//   * per-frame metrics (history weight, reject reasons, history version)
 //   * raw noisy float data + history float data, retained for inspection
+//
+// History ownership lives in the renderer's HistoryStore; this runner only
+// borrows it through the normal frame path. Canceling never invalidates or
+// disposes the chain — a canceled run returns its frames and leaves the
+// history identity intact so a rerun can present the matching frame. Segment
+// boundaries are pinned in a CheckpointStore with epoch/version/frame.
 //
 // No extra samples are taken for previews: all capture paths re-tonemap the
 // existing float buffers, so the comparison cannot be "helped" by raising the
 // per-frame sample count.
+
+import { CheckpointStore } from '../temporal/checkpointStore.js';
 
 export class JobRunner {
   constructor(renderer, plan, options = {}) {
@@ -21,6 +29,7 @@ export class JobRunner {
     this.onFrame = options.onFrame || (() => {});
     this.onProgress = options.onProgress || (() => {});
     this.onSegment = options.onSegment || (() => {});
+    this.checkpoints = options.checkpoints || new CheckpointStore();
     this.cancelled = false;
     this.frames = [];
     this.seams = [];
@@ -34,10 +43,15 @@ export class JobRunner {
     const { renderer, plan } = this;
     const totalDelivered = plan.totalFrames;
     let delivered = 0;
+    // A fresh job starts from an explicit, named empty chain. This is the
+    // only invalidation the runner performs; cancellation below never clears.
     renderer.clearHistory();
 
     for (const seg of plan.segments) {
-      if (this.cancelled) return { cancelled: true, frames: this.frames };
+      if (this.cancelled) {
+        renderer.releaseFrame();
+        return { cancelled: true, frames: this.frames, checkpoints: this.checkpoints.listCheckpoints() };
+      }
 
       this.onSegment({ type: 'start', segment: seg });
 
@@ -45,9 +59,14 @@ export class JobRunner {
         // Warm-up: replay the frames immediately preceding this segment
         // through the exact same temporal path. Their output is discarded but
         // history is rebuilt, so the first delivered frame has the same
-        // history weight as a continuous run.
+        // history weight as a continuous run. The replay window is opened
+        // explicitly so out-of-order frames never reuse stale history.
+        renderer.beginReplay(`segment-${seg.index}-warmup`);
         for (let f = seg.warmupStart; f <= seg.warmupEnd; f++) {
-          if (this.cancelled) return { cancelled: true, frames: this.frames };
+          if (this.cancelled) {
+            renderer.releaseFrame();
+            return { cancelled: true, frames: this.frames, checkpoints: this.checkpoints.listCheckpoints() };
+          }
           renderer.renderFrame(f);
           this.onSegment({ type: 'warmup', segment: seg, frame: f });
           await yieldToBrowser();
@@ -60,7 +79,10 @@ export class JobRunner {
       }
 
       for (let f = seg.start; f <= seg.end; f++) {
-        if (this.cancelled) return { cancelled: true, frames: this.frames };
+        if (this.cancelled) {
+          renderer.releaseFrame();
+          return { cancelled: true, frames: this.frames, checkpoints: this.checkpoints.listCheckpoints() };
+        }
         const metrics = renderer.renderFrame(f, { resetHistory: false });
         const record = {
           frame: f,
@@ -74,12 +96,26 @@ export class JobRunner {
           width: renderer.width,
           height: renderer.height,
           segment: seg.index,
+          historyVersion: metrics.historyVersion,
+          historyEpoch: metrics.historyEpoch,
         };
         this.frames.push(record);
         this.onFrame(record);
         delivered++;
         this.onProgress({ delivered, total: totalDelivered, segment: seg.index });
         await yieldToBrowser();
+      }
+      // Pin the rebuilt chain at each segment boundary using its real frame
+      // identity and history version; no default checkpoint is synthesized.
+      const lastRecord = this.frames.filter((x) => x.segment === seg.index).at(-1);
+      if (lastRecord) {
+        this.checkpoints.saveCheckpoint({
+          frame: lastRecord.frame,
+          epoch: lastRecord.historyEpoch,
+          version: lastRecord.historyVersion,
+          reason: `segment-${seg.index}-done`,
+          plan: { segment: seg.index, start: seg.start, end: seg.end },
+        });
       }
       this.onSegment({ type: 'done', segment: seg, frames: this.frames.filter((x) => x.segment === seg.index) });
     }
@@ -88,6 +124,7 @@ export class JobRunner {
       cancelled: false,
       frames: this.frames,
       seams: this.seams,
+      checkpoints: this.checkpoints.listCheckpoints(),
       plan,
     };
   }

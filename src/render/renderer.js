@@ -9,6 +9,7 @@ import {
 } from './shaders.js';
 import { perspective, lookAt, multiply, invert } from '../math/mat4.js';
 import { packScene, jitterForFrame, cameraForFrame } from '../scene/scene.js';
+import { HistoryStore, FrameIdentityError } from '../temporal/historyStore.js';
 
 const SCENE_UNIFORMS = [
   'uSphereCount', 'uBoxCount',
@@ -90,7 +91,10 @@ export class DenoiseRenderer {
       composite: getUniforms(gl, this.programs.composite, COMPOSITE_UNIFORMS),
     };
     this.packed = packScene(scene);
-    this.rtPathPrevDepth = null;
+    // History artifacts (double-buffered color/weight + previous depth) are
+    // owned by HistoryStore; the renderer borrows them per frame.
+    this.history = new HistoryStore(gl, this.width, this.height);
+    this.lastHistoryAnomaly = null;
     this._initTargets();
     this._initCameras();
   }
@@ -101,12 +105,6 @@ export class DenoiseRenderer {
     this.rtSample = createRenderTarget(gl, width, height, { attachments: 4 });
     this.rtAccumColor = createRenderTarget(gl, width, height, { attachments: 1 });
     this.rtTemporal = createRenderTarget(gl, width, height, { attachments: 2 });
-    this.rtHistory = [
-      createRenderTarget(gl, width, height, { attachments: 1 }),
-      createRenderTarget(gl, width, height, { attachments: 1 }),
-    ];
-    this.historyIndex = 0;
-    this.historyValid = false;
     this.rtSpatial = [
       createRenderTarget(gl, width, height, { attachments: 1 }),
       createRenderTarget(gl, width, height, { attachments: 1 }),
@@ -144,6 +142,8 @@ export class DenoiseRenderer {
     this.canvas.height = this.height;
     this.packed = packScene(scene);
     this._disposeTargets();
+    this.history = new HistoryStore(this.gl, this.width, this.height);
+    this.lastHistoryAnomaly = null;
     this._initTargets();
     this._initCameras();
   }
@@ -152,8 +152,45 @@ export class DenoiseRenderer {
     this.settings = { ...this.settings, ...patch };
   }
 
+  // Explicit history invalidation. Storage itself stays allocated so a
+  // canceled or rerun job can rebuild the chain on the same targets.
   clearHistory() {
-    this._clearAllHistory();
+    const state = this.history.invalidate('clearHistory');
+    this.lastHistoryAnomaly = { type: 'history-cleared', ...state, at: new Date().toISOString() };
+  }
+
+  // Open a replay window: the caller is about to rebuild a predecessor chain
+  // by rendering an older range sequentially (segment warm-up or a rerun after
+  // cancel). The chain identity is restarted explicitly rather than silently
+  // attaching stale history to an out-of-order frame.
+  beginReplay(reason = 'warmup-replay') {
+    const state = this.history.invalidate(reason);
+    this.lastHistoryAnomaly = { type: reason, ...state, at: new Date().toISOString() };
+    return state;
+  }
+
+  // Read-only identity of the history chain currently held by the store.
+  historyState() {
+    return this.history.describe();
+  }
+
+  // Compatibility views for code that historically reached into renderer
+  // internals (display passes, the test harness). The targets remain owned by
+  // HistoryStore; these getters never allocate.
+  get rtHistory() {
+    return this.history.colorTargets;
+  }
+
+  get historyIndex() {
+    return this.history.index;
+  }
+
+  get historyValid() {
+    return this.history.valid;
+  }
+
+  get rtPathPrevDepth() {
+    return this.history.prevDepthTarget;
   }
 
   _drawFullscreen() {
@@ -334,74 +371,98 @@ export class DenoiseRenderer {
     this._drawFullscreen();
   }
 
-  _clearAllHistory() {
-    const gl = this.gl;
-    for (const rt of this.rtHistory) {
-      bindRenderTarget(gl, rt);
-      gl.clearColor(0, 0, 0, 0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-    }
-    this.historyValid = false;
-    this.historyIndex = 0;
-  }
-
-  // Renders frame f with temporal accumulation. Caller is responsible for
-  // calling frames in order or resetting history explicitly.
+  // Renders frame f with temporal accumulation. The history chain is borrowed
+  // from HistoryStore under the frame's identity: a rerun must present frame
+  // lastFrame+1, or clearHistory()/warm-up replay must rebuild the chain first.
+  // With { allowRestart: true } an out-of-order frame explicitly invalidates
+  // the chain and is reported as a history anomaly (legacy replay callers);
+  // without it a frame-identity mismatch throws instead of hiding the error.
   renderFrame(frame, opts = {}) {
     const gl = this.gl;
     const s = this.settings;
-    if (!this.rtPathPrevDepth) {
-      this.rtPathPrevDepth = createRenderTarget(gl, this.width, this.height, { attachments: 1 });
-      bindRenderTarget(gl, this.rtPathPrevDepth);
-      gl.clearColor(0, 0, 0, 0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-    }
-    const reset = opts.resetHistory === true || !this.historyValid;
+    // Legacy explicit reset: invalidate the named chain first instead of
+    // silently ignoring the option. A no-history frame still follows the same
+    // shader path and reports reason code 1.
     if (opts.resetHistory === true) {
-      this._clearAllHistory();
+      const state = this.history.invalidate(`resetHistory@${frame}`);
+      this.lastHistoryAnomaly = { type: 'explicit-reset', frame, ...state, at: new Date().toISOString() };
     }
-
-    // --- 1. Path trace (real stochastic samples + subpixel jitter).
-    const spp = Math.max(1, Math.round(s.samplesPerFrame));
-    this._renderPathTrace(frame, 0, this.rtSample);
-    if (spp > 1) {
-      this._copyInto(this.rtSample, 0, this.rtAccumColor);
-      for (let i = 1; i < spp; i++) {
-        this._renderPathTrace(frame, i, this.rtSample);
-        this._accumulate(this.rtSample, this.rtAccumColor, this.rtSpatial[0], i, false);
-        this._copyInto(this.rtSpatial[0], 0, this.rtAccumColor);
+    let lease;
+    try {
+      lease = this.history.acquire(frame);
+    } catch (err) {
+      if (err instanceof FrameIdentityError && opts.allowRestart === true) {
+        const state = this.history.invalidate(`rerun@${frame}`);
+        this.lastHistoryAnomaly = {
+          type: 'frame-rerun', frame, expected: err.details.expected, ...state,
+          at: new Date().toISOString(),
+        };
+        lease = this.history.acquire(frame);
+      } else {
+        throw err;
       }
-      this._copyColorInto(this.rtAccumColor, this.rtSample);
     }
+    const reset = !lease.valid;
+    try {
+      // --- 1. Path trace (real stochastic samples + subpixel jitter).
+      const spp = Math.max(1, Math.round(s.samplesPerFrame));
+      this._renderPathTrace(frame, 0, this.rtSample);
+      if (spp > 1) {
+        this._copyInto(this.rtSample, 0, this.rtAccumColor);
+        for (let i = 1; i < spp; i++) {
+          this._renderPathTrace(frame, i, this.rtSample);
+          this._accumulate(this.rtSample, this.rtAccumColor, this.rtSpatial[0], i, false);
+          this._copyInto(this.rtSpatial[0], 0, this.rtAccumColor);
+        }
+        this._copyColorInto(this.rtAccumColor, this.rtSample);
+      }
 
-    // --- 2. Temporal integration against reprojected history.
-    const readIdx = this.historyIndex;
-    const writeIdx = 1 - readIdx;
-    // rtPathPrevDepth stores the previous frame's normal/depth attachment in
-    // its (single) color attachment 0.
-    const prevDepthTex = this.historyValid
-      ? this.rtPathPrevDepth.textures[0]
-      : this.rtSample.textures[1];
-    this._temporal(this.rtSample, this.rtHistory[readIdx], this.rtTemporal, prevDepthTex);
+      // --- 2. Temporal integration against reprojected history.
+      // lease.readColor / writeColor are the store's double buffer; the depth
+      // fallback keeps the reason-code-1 no-history path identical.
+      const prevDepthTex = lease.valid
+        ? lease.prevDepth.textures[0]
+        : this.rtSample.textures[1];
+      this._temporal(this.rtSample, lease.readColor, this.rtTemporal, prevDepthTex);
 
-    // --- 3. Current-frame only spatial result (independent comparison).
-    this._spatial(this.rtSample, this.rtIndependent);
+      // --- 3. Current-frame only spatial result (independent comparison).
+      this._spatial(this.rtSample, this.rtIndependent);
 
-    // --- 4. Edge-aware spatial cleanup of the temporal result.
-    this._copyInto(this.rtTemporal, 0, this.rtSpatial[0]);
-    const passes = Math.max(1, s.spatialPasses);
-    for (let p = 0; p < passes; p++) {
-      this._spatial(this.rtSpatial[p % 2], this.rtSpatial[(p + 1) % 2]);
+      // --- 4. Edge-aware spatial cleanup of the temporal result.
+      this._copyInto(this.rtTemporal, 0, this.rtSpatial[0]);
+      const passes = Math.max(1, s.spatialPasses);
+      for (let p = 0; p < passes; p++) {
+        this._spatial(this.rtSpatial[p % 2], this.rtSpatial[(p + 1) % 2]);
+      }
+      this._copyInto(this.rtSpatial[passes % 2], 0, lease.writeColor);
+
+      // --- 5. Keep G-buffer depth for next frame's disocclusion test.
+      this._copyInto(this.rtSample, 1, lease.prevDepth);
+
+      const committed = this.history.commit(lease);
+      const metrics = this._readAdoptionMetrics();
+      metrics.historyVersion = committed.version;
+      metrics.historyEpoch = committed.epoch;
+      metrics.historyFrame = committed.frame;
+      metrics.historyValid = true;
+      metrics.noHistoryFallback = reset;
+      metrics.anomaly = this.lastHistoryAnomaly && this.lastHistoryAnomaly.epoch === committed.epoch
+        ? this.lastHistoryAnomaly.type
+        : null;
+      return metrics;
+    } catch (err) {
+      // A failed frame must not leave the store locked, but it must not destroy
+      // shared history either; release keeps the chain untouched.
+      this.history.release(lease);
+      throw err;
     }
-    this._copyInto(this.rtSpatial[passes % 2], 0, this.rtHistory[writeIdx]);
+  }
 
-    // --- 5. Keep G-buffer depth for next frame's disocclusion test.
-    this._copyInto(this.rtSample, 1, this.rtPathPrevDepth);
-
-    this.historyIndex = writeIdx;
-    this.historyValid = true;
-
-    return this._readAdoptionMetrics();
+  // Return a borrowed frame without touching the chain. Cancel paths use this
+  // so shared history state is never destroyed early by a canceled task.
+  releaseFrame() {
+    if (this.history.leased) this.history.release(this.history.activeLease);
+    return this.history.describe();
   }
 
   _readAdoptionMetrics() {
@@ -608,15 +669,14 @@ void main() {
 
   _disposeTargets() {
     const gl = this.gl;
-    for (const rt of [this.rtSample, this.rtAccumColor, this.rtTemporal, this.rtHistory[0],
-      this.rtHistory[1], this.rtSpatial[0], this.rtSpatial[1], this.rtIndependent,
+    for (const rt of [this.rtSample, this.rtAccumColor, this.rtTemporal,
+      this.rtSpatial[0], this.rtSpatial[1], this.rtIndependent,
       this.rtDisplay, this.rtDisplayB, this.rtDisplayC]) {
       destroyRenderTarget(gl, rt);
     }
-    if (this.rtPathPrevDepth) {
-      destroyRenderTarget(gl, this.rtPathPrevDepth);
-      this.rtPathPrevDepth = null;
-    }
+    // History targets belong to HistoryStore; release them through its own
+    // lifecycle so ownership stays in one place.
+    this.history?.dispose();
   }
 
   dispose() {

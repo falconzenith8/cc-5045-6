@@ -100,6 +100,7 @@ function App() {
   const [exporting, setExporting] = useState('');
   const [summary, setSummary] = useState(null);
   const [rendererError, setRendererError] = useState(null);
+  const [historyAnomaly, setHistoryAnomaly] = useState(null);
 
   const scene = useMemo(() => SCENE_LIST.find((s) => s.id === sceneId), [sceneId]);
   const currentRecord = frames[current] || null;
@@ -168,6 +169,7 @@ function App() {
     setError(null);
     setSummary(null);
     setSeamReport(null);
+    setHistoryAnomaly(null);
     setRunning(true);
     setFrames([]);
     setCurrent(0);
@@ -178,6 +180,10 @@ function App() {
       onFrame: (rec) => {
         collected.push(rec);
         setFrames((prev) => [...prev, rec]);
+        if (rec.metrics.anomaly) {
+          setHistoryAnomaly({ frame: rec.frame, type: rec.metrics.anomaly, epoch: rec.historyEpoch });
+          log(`帧 ${rec.frame} 历史异常：${rec.metrics.anomaly}（epoch ${rec.historyEpoch}）`, 'warn');
+        }
         // Live preview goes to the CPU overlay canvas; the WebGL canvas owns
         // the renderer's context and cannot host a 2D context.
         const c = cpuCanvasRef.current;
@@ -231,8 +237,10 @@ function App() {
     const renderer = rendererRef.current;
     if (!renderer) return;
     renderer.clearHistory();
+    const state = renderer.historyState();
+    setHistoryAnomaly(null);
     setHistoryCleared((n) => n + 1);
-    log('历史已清除：下一帧将以无历史回退（原因码 1）开始累积', 'warn');
+    log(`历史已清除：epoch ${state.epoch}，下一帧将以无历史回退（原因码 1）开始累积`, 'warn');
   }, [log]);
 
   // Playback
@@ -363,6 +371,12 @@ function App() {
 
       {rendererError && <div className="banner error">渲染器错误：{rendererError}</div>}
       {error && <div className="banner error">{error}</div>}
+      {historyAnomaly && (
+        <div className="banner warn">
+          历史状态异常：{historyAnomaly.type}{historyAnomaly.frame !== null ? `（帧 ${historyAnomaly.frame}）` : ''}
+          ；当前链 epoch {historyAnomaly.epoch}，重跑须按对应帧身份重建历史。
+        </div>
+      )}
       {!rendererError && historyCleared > 0 && (
         <div className="banner warn">历史已清除 {historyCleared} 次；清除后首帧历史采纳率为 0%，回退原因为“无历史”。</div>
       )}
@@ -629,6 +643,10 @@ function App() {
         <aside className="panel right">
           <section>
             <h2>序列进度</h2>
+            <div className="subtle small">
+              运行状态：
+              <b className={running ? 'okText' : ''}>{running ? '运行中（取消会保留已产出帧与历史，不销毁共享状态）' : frames.length ? '已完成 / 可重放' : '空闲'}</b>
+            </div>
             <div className="progressTrack"><div className="progressFill" style={{ width: `${progress.total ? (progress.delivered / progress.total) * 100 : 0}%` }} /></div>
             <div className="subtle small">{progress.delivered} / {progress.total} 帧已产出{seamReport ? ` · ${seamReport.length} 处接缝（已预热）` : ''}</div>
             <div className="filmstrip">
@@ -648,12 +666,17 @@ function App() {
               <ul className="kv">
                 <li><span>帧号</span><b className="mono">{currentRecord.frame}</b></li>
                 <li><span>段</span><b className="mono">{currentRecord.segment}</b></li>
+                <li><span>历史版本</span><b className="mono">v{currentRecord.historyVersion} · epoch {currentRecord.historyEpoch}</b></li>
                 <li><span>历史采纳</span><b className="mono">{fmtPct(currentRecord.metrics.acceptedPct)}</b></li>
                 <li><span>平均权重</span><b className="mono">{currentRecord.metrics.meanHistoryWeight.toFixed(3)}</b></li>
                 <li><span>钳制像素</span><b className="mono">{fmtPct(currentRecord.metrics.clampedPct)}</b></li>
+                <li><span>无历史回退</span><b className="mono">{currentRecord.metrics.noHistoryFallback ? '是（原因码 1）' : '否'}</b></li>
                 <li><span>原始噪声浮点保留</span><b>{currentRecord.rawNoisyFloat ? '是' : '否'}</b></li>
               </ul>
             ) : <p className="subtle small">尚未渲染。</p>}
+            {currentRecord?.metrics.anomaly && (
+              <div className="banner warn small">历史异常：{currentRecord.metrics.anomaly}（帧 {currentRecord.frame}）</div>
+            )}
           </section>
           <section>
             <h2>回退策略</h2>

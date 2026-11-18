@@ -84,5 +84,76 @@ log(`  连续运行首帧采纳 ${run.contAccepted.toFixed(1)}%`);
 const seamOk = Math.abs(run.warmAccepted - run.contAccepted) < 2 && run.naiveAccepted < 5;
 log(`  结论：${seamOk ? '预热抹平接缝；无预热首帧历史归零' : '未达预期'}`);
 
+// 4. History-ownership refactor: cancel/reorder equivalence and missing
+//    history. A canceled run keeps its chain; the rerun rebuilds through an
+//    explicit replay window and must match a continuous run within the frame
+//    RMSE / adoption tolerances. History versions and epochs are reported as
+//    execution evidence rather than inferred from defaults.
+log('');
+log('== 4. 取消重排与历史缺失（历史版本 + 帧误差限定等价性） ==');
+const equivalence = await page.evaluate(async () => {
+  const { compareExecutions } = await import('/src/temporal/equivalence.js');
+  const h = window.__harness;
+  h.init('moving-camera', { samplesPerFrame: 1, maxHistory: 12 });
+  const resumeFrom = 20;
+  const end = 30;
+  const continuous = h.continuousRun(resumeFrom, end);
+  const resumed = h.cancelResumeRun(resumeFrom, end, 12);
+  const toRecords = (list) => list.map((f) => ({
+    frame: f.frame,
+    denoised: Uint8Array.from(f.denoised),
+    metrics: f.metrics,
+  }));
+  const report = compareExecutions(toRecords(continuous.frames), toRecords(resumed.frames), {
+    pixelRmse: 0.02, lumaMad: 0.02, acceptedPct: 1.0, meanWeight: 0.02,
+  });
+  return {
+    retained: resumed.retained,
+    replayRange: resumed.replayRange,
+    resumedFirstVersion: resumed.frames[0].historyVersion,
+    continuousFirstVersion: continuous.frames[0].historyVersion,
+    frameCount: report.frameCount,
+    maxRmse: report.maxRmse,
+    maxLumaMad: report.maxLumaMad,
+    maxAcceptedDelta: report.maxAcceptedDelta,
+    maxWeightDelta: report.maxWeightDelta,
+    equivalent: report.equivalent,
+    problems: report.problems,
+  };
+});
+const report = {
+  equivalent: equivalence.equivalent,
+  maxRmse: equivalence.maxRmse,
+  maxLumaMad: equivalence.maxLumaMad,
+  maxAcceptedDelta: equivalence.maxAcceptedDelta,
+  maxWeightDelta: equivalence.maxWeightDelta,
+  problems: equivalence.problems,
+};
+log(`  连续参考帧 ${equivalence.frameCount}，取消重跑帧 ${equivalence.frameCount}`);
+log(`  取消时保留链末端：帧 ${equivalence.retained.lastFrame}，` +
+  `epoch ${equivalence.retained.epoch}，v${equivalence.retained.version}`);
+log(`  重放窗口：帧 ${equivalence.replayRange[0]}–${equivalence.replayRange[1]}（显式 beginReplay）`);
+log(`  重跑首帧历史版本 v${equivalence.resumedFirstVersion} / ` +
+  `连续首帧 v${equivalence.continuousFirstVersion}`);
+log(`  最大像素 RMSE ${report.maxRmse.toFixed(4)}，最大亮度差 ${report.maxLumaMad.toFixed(4)}，` +
+  `最大采纳率差 ${report.maxAcceptedDelta.toFixed(2)}pp，最大权重差 ${report.maxWeightDelta.toFixed(4)}`);
+for (const p of report.problems) log(`  等价性问题：${p}`);
+log(`  结论：${report.equivalent ? '取消重排与连续运行在容差内等价' : '取消重排超出帧误差容差'}`);
+
+const missing = await page.evaluate(() => {
+  const h = window.__harness;
+  h.init('moving-camera', { samplesPerFrame: 1, maxHistory: 12 });
+  return h.missingHistoryProbe(8, 9);
+});
+log(`  历史缺失：清除前 epoch ${missing.before.epoch} 末端帧 ${missing.before.lastFrame}；` +
+  `清除后 epoch ${missing.afterClear.epoch} 且 valid=${missing.afterClear.valid}`);
+log(`  清除后首帧采纳 ${missing.nextAcceptedPct.toFixed(1)}%，原因码1像素 ${missing.nextReason1}，` +
+  `存储保留=${missing.storageSurvived}`);
+const missingOk = missing.afterClear.epoch > missing.before.epoch &&
+  missing.afterClear.valid === false &&
+  missing.nextAcceptedPct < 2 && missing.nextReason1 > 0 && missing.storageSurvived;
+log(`  结论：${missingOk ? '历史缺失明确回退原因码1，且未提前销毁共享存储' : '历史缺失处理异常'}`);
+
 await browser.close();
 if (!seamOk) process.exit(3);
+if (!report.equivalent || !missingOk) process.exit(4);

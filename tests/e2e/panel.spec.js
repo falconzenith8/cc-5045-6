@@ -53,7 +53,7 @@ test('panel reports real temporal results and exposes scrub + history controls',
 
   // Clearing history is announced and takes effect on the next delivered frame.
   await page.getByRole('button', { name: '清除历史' }).click();
-  await expect(page.locator('.banner.warn')).toContainText('历史已清除');
+  await expect(page.locator('.banner.warn', { hasText: '历史已清除' })).toContainText('历史已清除');
 });
 
 test('two-segment run preheats the seam and reports it', async ({ page }) => {
